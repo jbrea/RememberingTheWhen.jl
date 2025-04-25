@@ -1,3 +1,4 @@
+using NeuralProcessingOfTime: similarity
 using NeuralProcessingOfTime
 using DataFrames, PGFPlotsX, Statistics, ColorSchemes
 import NeuralProcessingOfTime: age_at_similarity
@@ -89,7 +90,7 @@ function stimuli_task2(; trials = 50, inter_trial = 5)
     tokens = [Token(red, triangle),
               Token(black, circle),
               Token(blue, square)]
-    sequence = Token[]
+    sequence = Token{Color, Shape}[]
     for t in 1:trials
         tok = iseven(t) ? tokens[1] : tokens[3]
         for filler in (1, 2)
@@ -113,7 +114,7 @@ function stimuli_task3(; trials = 50,
     tokens = [Token(red, triangle),
               Token(black, circle)
              ]
-    sequence = Token[]
+    sequence = Token{Color, Shape}[]
     for _ in 1:trials
         length(sequence) == max_length && return sequence
         push!(sequence, tokens[1])
@@ -330,24 +331,33 @@ end
 
 function sparse_random_brain(; winit = [.9, .2], only_first = false, η = 1.,
                                act = IdPlus(), clipper = Clamp(),
+                               n_intermediate = 50, n_content = 200, n_action = 2,
+                               latent_state_increment_factor = 6,
+                               n_color = length(instances(NeuralProcessingOfTime.Color)),
+                               n_shape = length(instances(NeuralProcessingOfTime.Shape)),
+                               sparsity = 1/(n_color+n_shape-2),
+                               max_fanin = n_color+n_shape-2,
+                               in_weights = nothing,
                                content_activation = x -> heaviside(x - 1.5))
-    actuators = Neurons("actuators", Distributed(x = zeros(2)), act)
-    token_sensor = TokenSensor()
+    actuators = Neurons("actuators", Distributed(x = zeros(n_action)), act)
+    token_sensor = TokenSensor(; n_color, n_shape)
     reward_sensor = RewardSensor()
-    intermediate = Neurons("intermediate", Distributed(50), heaviside)
-    content = Neurons("content", Distributed(200), content_activation)
+    intermediate = Neurons("intermediate", Distributed(n_intermediate), heaviside)
+    content = Neurons("content", Distributed(n_content), content_activation)
     stepper = FixedMicroSteps(N = 3)
     connections = (
-                   SparseRandomConnection(pre = token_sensor.neurons,
-                                          post = intermediate,
-                                          sparsity = 1/12),
+                   SparseRandomConnection(; pre = token_sensor.neurons,
+                                            post = intermediate,
+                                            in_weights,
+                                            sparsity),
                    SparseRandomConnection(pre = token_sensor.neurons,
                                           post = content,
-                                          sparsity = RandomInFan(min = 1, max = 12)),
+                                          in_weights,
+                                          sparsity = RandomInFan(min = 1, max = max_fanin)),
                    Connection(plasticity = (HebbianLatentStateDecay(pre = intermediate,
                                                                     post = content,
                                                                     kind = Additive(1/3),
-                                                                    latent_state_increment = 6*hcat(fill(rand(length(content)), length(intermediate))...)
+                                                                    latent_state_increment = latent_state_increment_factor*hcat(fill(rand(length(content)), length(intermediate))...)
                                                                    ), ),
                               pre = intermediate,
                               post = content),
@@ -396,9 +406,9 @@ brains = Dict(:state_decay => hebbian_latent_state_decay_brain,
               :chrono => chrono_brain,
              )
 
-# push!(PGFPlotsX.CUSTOM_PREAMBLE, read(joinpath(DOCPATH, "modelnames.tex"), String))
+push!(PGFPlotsX.CUSTOM_PREAMBLE, read(joinpath(DOCPATH, "modelnames.tex"), String))
 
-function names(s; extra = Dict())
+function modelnames(s; extra = Dict())
     haskey(extra, s) && return extra[s]
     spl = split("$s", '_')
     name = if spl[1] == "sparse"
@@ -406,7 +416,7 @@ function names(s; extra = Dict())
         raw"\sparse{}"
     elseif spl[1] == "increment"
 #         "Representational-Drift"
-        raw"\increment{}"
+        raw"\incrementmodel{}"
     elseif spl[1] == "state"
 #         "Organized-Pruning"
         raw"\statedecay{}"
@@ -491,7 +501,7 @@ f1 = @pgf PGFPlotsX.Axis({xlabel = raw"$\Delta t_\mathrm{test}$",
                  Coordinates(1:5, analyse_results(res1[k]).act2))
             for k in ks]...,
            Plot({black, dotted}, Expression("$(res1[:ap])")),
-           PGFPlotsX.Legend([names.(ks);
+           PGFPlotsX.Legend([modelnames.(ks);
                              "before learning"])
           )
 
@@ -533,7 +543,7 @@ f2 = @pgf PGFPlotsX.Axis({legend_pos = "outer north east", xlabel = "session",
             for k in ks]...,
            Plot({dotted}, Coordinates(1:200, session_average(res2[:optimal]))),
            Plot({dotted, orange}, Coordinates(1:200, fill(0.5, 200))),
-           PGFPlotsX.Legend([names.(ks); "optimal"; "best linear"
+           PGFPlotsX.Legend([modelnames.(ks); "optimal"; "best linear"
                             ])
           )
 
@@ -573,8 +583,113 @@ f3 = @pgf PGFPlotsX.Axis({legend_pos = "outer north east", xlabel = "trial",
                [Plot({styles(k)...},
                      Coordinates(1:100, res3[k])) for k in ks]...,
                Plot({dotted}, Coordinates(1:100, res3[:optimal])),
-               PGFPlotsX.Legend([names.(ks); "optimal"])
+               PGFPlotsX.Legend([modelnames.(ks); "optimal"])
               )
 
 
 pgfsave(joinpath(DOCPATH, "sim3.tikz"), f3)
+
+# big sim
+
+function stimuli_bigtask(; T = 20_000, n_color = 10_000, n_shape = 10)
+    sequence = Token{Int,Int}[]
+    locations = randperm(n_color) .- 1
+    cache_event_counter = 1
+    for t in 1:T
+        if length(sequence) > 10 && rand() > 1/3 # probe
+            # power law sampling of past locations
+            recall_weight = 1 ./ sqrt.((length(sequence):-1:1))
+            c = 0
+            while true
+                idx = NeuralProcessingOfTime.wsample(recall_weight)
+                token = sequence[idx]
+                if token.s > 0 # look only at cache locations
+                    c = token.c
+                    break
+                end
+            end
+            token = Token(c, 0)
+        else
+            token = Token(locations[cache_event_counter], rand(1:n_shape-1))
+            cache_event_counter += 1
+        end
+        push!(sequence, token)
+    end
+    sequence
+end
+function optimal_action_bigtask(history, query)
+    query.s != 0 && return 2
+    age = age_at_similarity(history, query, threshold = 1, similarity = NeuralProcessingOfTime.csimilarity)
+    token = history[end-age+1]
+    2-Int(age < (token.s == 0 ? 0 : token.s < 6 ? 10 : 120))
+end
+function optimal_action_oneage_bigtask(history, query, refage)
+    query.s != 0 && return 2
+    age = age_at_similarity(history, query, threshold = 1, similarity = NeuralProcessingOfTime.csimilarity)
+    token = history[end-age+1]
+    2-Int(age < (token.s == 0 ? 0 : refage))
+end
+function reward_bigtask(history, query, action)
+    (query.s != 0 || action == 0 || action == 2) && return 0.
+    age = age_at_similarity(history, query, threshold = 1, similarity = NeuralProcessingOfTime.csimilarity)
+    token = history[end-age+1]
+    float(age < (token.s == 0 ? 0 : token.s < 6 ? 10 : 120))-.2
+end
+function bigtask_rewards(stimuli, policy)
+    [reward_bigtask(stimuli[1:t-1], stimuli[t],
+                    policy(stimuli[1:t-1], stimuli[t]))
+     for t in eachindex(stimuli)]
+end
+
+Random.seed!(1221)
+n_color = 1000
+n_shape = 10
+bigbrain = sparse_random_brain(; act = exp, clipper = Shifter(), n_intermediate = 5000, n_content = 10000, latent_state_increment_factor = 200, n_color, n_shape, η = .002, winit = [.5, .5], max_fanin = 10, sparsity = .001, content_activation = heaviside)
+results = []
+baseline_policies = (best = optimal_action_bigtask,
+                     worst = (h, ht) -> optimal_action_bigtask(h, ht) == 1 ? 2 : 1,
+                     random = (_, _) -> rand(1:2),
+                     all1 = (_, _) -> 1,
+                     all2 = (_, _) -> 2,
+                     oneage1 = (h, ht) -> optimal_action_oneage_bigtask(h, ht, 10),
+                     oneage2 = (h, ht) -> optimal_action_oneage_bigtask(h, ht, 120))
+for epoch in 1:10
+    stimuli = stimuli_bigtask(; T = 1000, n_color, n_shape);
+    baselines = map(p -> bigtask_rewards(stimuli, p), baseline_policies)
+    @time res = run_task!(bigbrain, stimuli, reward_bigtask, TrackAll())
+    @show epoch sum(baselines.best) sum(baselines.random) sum(baselines.all1) sum(res.r)
+    push!(results, (; stimuli, baselines, res))
+end
+
+resultdf = vcat([DataFrame(map(p -> bigtask_rewards(r.stimuli, p),
+                               baseline_policies))
+                 for r in results]...)
+resultdf.model = vcat(getproperty.(getproperty.(results, :res), :r)...)
+test = vcat([[t.s == 0 for t in r.stimuli] for r in results]...)
+resultdf = resultdf[test, :]
+correctchoices = DataFrame([c .== resultdf.best for c in eachcol(resultdf)],
+                           names(resultdf))
+
+N = nrow(resultdf)
+smoother = [exp(-(i - j)^2/500^2) for i in 1:N, j in 1:N];
+smoother ./= sum(smoother, dims = 2);
+
+ks = names(resultdf)[[1; 3:end]]
+cs = Dict("best" => @pgf({black}),
+          "worst" => @pgf({black, dotted}),
+          "random" => @pgf({black,dashed}),
+          "all1" => @pgf({blue}),
+          "all2" => @pgf({blue,dashed}),
+          "oneage1" => @pgf({green}),
+          "oneage2" => @pgf({green,dashed}),
+          "model" => @pgf({red}))
+f4 = @pgf PGFPlotsX.Axis({legend_pos = "outer north east", xlabel = "trial",
+               ylabel = "average reward"},
+            [Plot(cs[k],
+                  Coordinates(1:N, smoother * getproperty(resultdf, k))) for k in ks]...,
+               PGFPlotsX.Legend(ks)
+              )
+
+
+
+csave(joinpath(DATAPATH, "bigtask.bson.zstd"), results)

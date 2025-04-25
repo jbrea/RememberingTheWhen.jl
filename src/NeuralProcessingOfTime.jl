@@ -9,12 +9,13 @@ using Random
 @enum Color black red green blue orange pink yellow
 @enum Shape shapeless triangle square pentagon circle halfcircle quartercircle
 
-struct Token
-    c::Color
-    s::Shape
+struct Token{C,S}
+    c::C
+    s::S
 end
 similarity(t1::Token, t2::Token) = ((t1.c == t2.c) + (t1.s == t2.s))/2
-function age_at_similarity(history, query; threshold = 1)
+csimilarity(t1::Token, t2::Token) = t1.c == t2.c
+function age_at_similarity(history, query; threshold = 1, similarity = similarity)
     age = 1
     for token in reverse(history)
         similarity(token, query) ≥ threshold && return age
@@ -48,7 +49,7 @@ function sense!(r::Rate, v)
 #     setactivity!(r, 1, v, previous = false)
     setactivity!(r, 1, v, previous = true)
 end
-function update!(r::Rate, f)
+@inline function update!(r::Rate, f)
     r.r₋ = f(r.r)
     r.r = 0.
     r
@@ -71,7 +72,7 @@ function sense!(o::OneHot, i)
 #     setactivity!(o, Int(i), 1, previous = false)
     setactivity!(o, Int(i), 1, previous = true)
 end
-function update!(o::OneHot, ::Any)
+@inline function update!(o::OneHot, ::Any)
     o.i₋ = o.i
     o.i = 0
     o
@@ -90,9 +91,12 @@ function setactivity!(d::Distributed, i, v; previous = false)
     end
 end
 Base.length(d::Distributed) = length(d.x)
-function update!(d::Distributed, f)
-    @. d.x₋ = f(d.x)
-    d.x .= 0
+@inline function update!(d::Distributed, f)
+    x₋, x = d.x₋, d.x
+    for i in eachindex(x)
+        x₋[i] = f(x[i])
+        x[i] = 0
+    end
     d
 end
 # struct OrderedPopRate
@@ -110,9 +114,7 @@ end
 function Base.show(io::IO, n::Neurons{C, A}) where {C, A}
     print(io, "Neurons ($(n.id), $C, $A)")
 end
-function update!(n::Neurons)
-    update!(n.code, n.activation)
-end
+@inline update!(n::Neurons) = update!(n.code, n.activation)
 function activity(n::Neurons, i; previous = false)
     # for previous activity activation is already applied in update!
     if previous
@@ -472,13 +474,26 @@ Base.@kwdef struct RandomInFan
     min::Int = 1
     max::Int
 end
-k_out_of_n(k::Int, n) = randperm(n)[1:k]
-k_out_of_n(::Val{:uniform}, n) = k_out_of_n(rand(1:n), n)
-k_out_of_n(r::RandomInFan, n) = k_out_of_n(rand(r.min:r.max), n)
+function k_out_of_n(k::Int, n, weights)
+    indices = collect(1:n)
+    _weights = copy(weights)
+    selected_indices = zeros(Int, k)
+    for i in eachindex(selected_indices)
+        chosen_index = wsample(_weights)
+        selected_indices[i] = indices[chosen_index]
+        deleteat!(indices, chosen_index)
+        deleteat!(_weights, chosen_index)
+    end
+    selected_indices
+end
+k_out_of_n(k::Int, n, ::Nothing) = randperm(n)[1:k]
+k_out_of_n(::Val{:uniform}, n, weights) = k_out_of_n(rand(1:n), n, weights)
+k_out_of_n(r::RandomInFan, n, weights) = k_out_of_n(rand(r.min:r.max), n, weights)
 function sparse_random_connections(pre, post;
                                    sparsity = 0.1,
+                                   weights = nothing,
                                    nin = isa(sparsity, Number) ? floor(Int, length(pre)*sparsity) : sparsity)
-    [k_out_of_n(nin, length(pre)) for _ in 1:length(post)]
+    [k_out_of_n(nin, length(pre), weights) for _ in 1:length(post)]
 end
 # Base.show(io::IO, ::SparseRandomConnection{M}) where M = print(io, "SparseRandomConnection ($M)")
 function propagate!(o::SparseRandomConnection)
@@ -495,8 +510,10 @@ update!(::SparseRandomConnection) = nothing
 struct TokenSensor{C}
     neurons::C
 end
-function TokenSensor(; color_code = OneHot{length(instances(Color))-1}(),
-                       shape_code = OneHot{length(instances(Color))-1}(),
+function TokenSensor(; n_color = length(instances(Color)),
+                       n_shape = length(instances(Shape)),
+                       color_code = OneHot{n_color-1}(),
+                       shape_code = OneHot{n_shape-1}(),
                        association = Concat)
     TokenSensor(Neurons("token sensor", association(color_code, shape_code)))
 end
@@ -592,18 +609,34 @@ function action!(actuator; rng = Random.GLOBAL_RNG)
     return 0
 end
 
-function micro_step!(brain::Brain; callback = () -> nothing)
-    for connection in brain.connections
-        propagate!(connection)
+function wsample(weights; rng = Random.GLOBAL_RNG)
+    s = sum(weights)
+    θ = rand(rng) * s
+    s = 0.
+    for i in eachindex(weights)
+        s += weights[i]
+        s > θ && return i
     end
+end
+
+update!(::Tuple{}) = nothing
+function update!(x::Tuple)
+    update!(first(x))
+    update!(Base.tail(x))
+end
+propagate!(::Tuple{}) = nothing
+function propagate!(x::Tuple)
+    propagate!(first(x))
+    propagate!(Base.tail(x))
+end
+
+
+function micro_step!(brain::Brain; callback = () -> nothing)
+    propagate!(brain.connections)
 #     @show brain.neurons[end-1].code
     a = action!(brain.actuators)
-    for connection in brain.connections
-        update!(connection)
-    end
-    for neurons in brain.neurons
-        update!(neurons)
-    end
+    update!(brain.connections)
+    update!(brain.neurons)
 #     @show brain.neurons[end-1].code
 #     @show activity.(Ref(brain.neurons[end-1]), 1:length(brain.neurons[end-1]),
 #                     previous = true)

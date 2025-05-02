@@ -14,7 +14,7 @@ struct Token{C,S}
     s::S
 end
 similarity(t1::Token, t2::Token) = ((t1.c == t2.c) + (t1.s == t2.s))/2
-csimilarity(t1::Token, t2::Token) = t1.c == t2.c
+csimilarity(t1::Token, t2::Token) = (t1.c == t2.c) - (t1.s == 0) # ignore tokens with s == 0
 function age_at_similarity(history, query; threshold = 1, similarity = similarity)
     age = 1
     for token in reverse(history)
@@ -115,8 +115,10 @@ function Base.show(io::IO, n::Neurons{C, A}) where {C, A}
     print(io, "Neurons ($(n.id), $C, $A)")
 end
 @inline update!(n::Neurons) = update!(n.code, n.activation)
+activity(n::Neurons; previous = false) = [activity(n, i; previous) for i in 1:length(n)]
 function activity(n::Neurons, i; previous = false)
     # for previous activity activation is already applied in update!
+    # TODO: This looks like a horrible hack and a source for bugs (e.g. in RewardModulatedHebbian using post instead of post.code can lead to wrong results)
     if previous
         activity(n.code, i, previous = true)
     else
@@ -136,14 +138,17 @@ end
 mul(w, i, pre::Rate, offset = 0) = w[i, 1 + offset] * pre.r₋
 mul(w, i, pre::Distributed, offset = 0) = sum(w[i, j + offset] * pre.x₋[j]
                                               for j in eachindex(pre.x₋))
-function propagate!(post::Neurons{<:Distributed}, pre, w)
+function propagate!(post::Neurons{<:Distributed}, pre, w, with_bias)
     for i in eachindex(post.code.x)
         post.code.x[i] += mul(w, i, pre.code)
+        if with_bias
+            post.code.x[i] += w[i, end]
+        end
     end
 end
-function propagate!(post, pre, w, modulator)
+function propagate!(post, pre, w, with_bias, modulator)
     is_silent(modulator) && return
-    propagate!(post, pre, w)
+    propagate!(post, pre, w, with_bias)
 end
 
 ###
@@ -193,29 +198,33 @@ end
 _getindex(x::Number, ::Any, Any) = x
 _getindex(x::AbstractMatrix, i, j) = x[i, j]
 _clamp!(::Any, ::Nothing, ::Nothing, ::Any, ::Any) = nothing
-function _clamp!(w, ::Nothing, max, i, j)
+@inline function _clamp!(w, ::Nothing, max, i, j)
     m = _getindex(max, i, j)
     if w[i, j] > m
         w[i, j] = m
     end
 end
-function _clamp!(w, min, ::Nothing, i, j)
+@inline function _clamp!(w, min, ::Nothing, i, j)
     m = _getindex(min, i, j)
     if w[i, j] < m
         w[i, j] = m
     end
 end
-function _clamp!(w, min, max, i, j)
+@inline function _clamp!(w, min, max, i, j)
     _clamp!(w, nothing, max, i, j)
     _clamp!(w, min, nothing, i, j)
 end
 function hebbian_update!(w, η, post, pre, modulator = 1.;
                          previous_post = false, previous_pre = false,
                          min = nothing, max = nothing)
-    for i in axes(w, 1), j in axes(w, 2)
-        w[i, j] += η * modulation(modulator, i, j) *
-                       activity(post, i, previous = previous_post) *
-                       activity(pre, j, previous = previous_pre)
+    N_pre = length(pre)
+    for j in axes(w, 2), i in axes(w, 1)
+        _post = activity(post, i, previous = previous_post)
+        _pre = j > N_pre ? 1. : activity(pre, j, previous = previous_pre)
+#         if _pre ≠ 0 && _post ≠ 0
+#             @show (_pre, _post)
+#         end
+        w[i, j] += η * modulation(modulator, i, j) * _post * _pre
         _clamp!(w, min, max, i, j)
     end
 end
@@ -264,23 +273,27 @@ function HebbianLatentStateDecay(; post = nothing, pre = nothing,
                             latent_state_increment,
                             θ, kind, η)
 end
-function update!(w, post, pre, p::HebbianLatentStateDecay)
-    for i in axes(w, 1), j in axes(w, 2)
-        if p.latent_state[i, j] < p.θ
-            w[i, j] = p.latent_state[i, j] = 0
+function _set_weights!(w, latent_state, θ)
+    @inbounds for i in eachindex(w)
+        if latent_state[i] < θ
+            w[i] = latent_state[i] = 0
         else
-            w[i, j] = 1.
+            w[i] = 1.
         end
     end
+end
+function update!(w, post, pre, p::HebbianLatentStateDecay)
+    _set_weights!(w, p.latent_state, p.θ)
     hebbian_update!(p.latent_state, p.η, post, pre, p.latent_state_increment,
                     max = p.latent_state_increment) # replacing traces
 #     @show p.latent_state post.code.x pre.code.x
     update!(p.latent_state, p.kind)
 end
-struct RewardModulatedHebbian{R,C}
+struct RewardModulatedHebbian{R,C,B}
     eligibility::Matrix{Float64}
     reward_sensor::R
     η::Float64
+    η_bias::B
     clipper::C
 end
 Base.@kwdef struct Clamp
@@ -296,11 +309,14 @@ function (s::Shifter)(w)
     end
 end
 function RewardModulatedHebbian(; post = nothing, pre = nothing,
-                                  eligibility = zeros(length(post), length(pre)),
-                                  reward_sensor = RewardSensor(), η = 1.,
+                                  with_bias = false,
+                                  eligibility = zeros(length(post), length(pre) + with_bias),
+                                  reward_sensor = RewardSensor(), η = 1., η_bias = with_bias ? η : nothing,
                                   clipper = Clamp())
-    RewardModulatedHebbian(eligibility, reward_sensor, η, clipper)
+    RewardModulatedHebbian(eligibility, reward_sensor, η, η_bias, clipper)
 end
+_adjust_bias!(::Nothing, ::Any, ::Any) = nothing
+_adjust_bias!(η_bias, η, eligibility) = eligibility[:, end] .*= η_bias / η
 function update!(w, post, pre, r::RewardModulatedHebbian)
 #     println("eligibility")
 #     display(r.eligibility)
@@ -312,10 +328,14 @@ function update!(w, post, pre, r::RewardModulatedHebbian)
 #         hebbian_update!(r.eligibility, 1., post, pre, previous_pre = true)
 #         @show post.code pre.code r.eligibility
 #     end
+    _adjust_bias!(r.η_bias, r.η, r.eligibility)
+#     if R ≠ 0
+#         @show R r.eligibility
+#     end
     w .+= r.η * R * r.eligibility
     r.clipper(w)
     r.eligibility .= 0
-    hebbian_update!(r.eligibility, 1., post, pre, previous_pre = true)
+    hebbian_update!(r.eligibility, 1., post.code, pre, previous_pre = true)
 end
 struct DelayedHebbian
     eligibility::Matrix{Float64}
@@ -363,9 +383,10 @@ abstract type AbstractStaticConnection{M} <: AbstractConnection end
 Base.@kwdef struct Connection{P, M, I, O} <: AbstractConnection
     plasticity::P = tuple()
     modulator::M = nothing
+    with_bias::Bool = false
     pre::I
     post::O
-    w::Matrix{Float64} = zeros(length(post), length(pre))
+    w::Matrix{Float64} = zeros(length(post), length(pre) + with_bias)
 end
 _showprepost(io, c) = print(io, "$(c.pre.id) -> $(c.post.id) : $(typeof(c).name.name)")
 function Base.show(io::IO, c::AbstractStaticConnection{M}) where M
@@ -378,6 +399,7 @@ function Base.show(io::IO, c::AbstractStaticConnection{M}) where M
 end
 function Base.show(io::IO, c::Connection{P,M}) where {P,M}
     _showprepost(io, c)
+    print(io,  " w/$(c.with_bias ? "" : "o") bias")
     if M != Nothing || P != Nothing
         print(io, " (")
         if P != Nothing
@@ -392,7 +414,7 @@ function Base.show(io::IO, c::Connection{P,M}) where {P,M}
         print(io, ")")
     end
 end
-propagate!(c::AbstractConnection) = propagate!(c.post, c.pre, c.w, c.modulator)
+propagate!(c::Connection) = propagate!(c.post, c.pre, c.w, c.with_bias, c.modulator)
 function update!(c::Connection)
     for p in c.plasticity
         update!(c.w, c.post, c.pre, p)
@@ -466,8 +488,8 @@ struct SparseRandomConnection{M, I, O} <: AbstractStaticConnection{M}
     post::O
 end
 indices(c::SparseRandomConnection) = vcat([[(i, j) for i in c.idxs[j]] for j in 1:length(c.post)]...)
-function SparseRandomConnection(; modulator = nothing, pre, post, sparsity = 0.1,
-                                  idxs = sparse_random_connections(pre, post; sparsity))
+function SparseRandomConnection(; modulator = nothing, pre, post, sparsity = 0.1, weights = nothing,
+                                  idxs = sparse_random_connections(pre, post; sparsity, weights))
     SparseRandomConnection(modulator, idxs, pre, post)
 end
 Base.@kwdef struct RandomInFan
@@ -582,31 +604,42 @@ postaction_activity_winner(::IdPlus, sa, S) = 1/sa - 1/S
 postaction_activity_looser(::IdPlus, sa, S) = -1/S
 postaction_activity_winner(::typeof(identity), sa, S) = 1.
 postaction_activity_looser(::typeof(identity), sa, S) = 0.
-function action!(actuator; rng = Random.GLOBAL_RNG)
+_numerically_stabilize!(::Any, ::Any) = nothing
+_numerically_stabilize!(code, ::typeof(exp)) = code .-= maximum(code)
+function action!(actuator; rng = Random.GLOBAL_RNG, greedy = false)
     Na = length(actuator)
     S0 = sum(actuator.code.x[i] for i in 1:Na)
-    S0 == 0 && return 0
+    S0 == 0 && return 0 # Is this needed anywhere?
+    _numerically_stabilize!(actuator.code.x, actuator.activation)
     S = sum(activity(actuator, i) for i in 1:Na)
-    θ = rand(rng) * S
-#     @show [activity(actuator, i) for i in 1:Na] θ
-    s = 0.
+    awinner = 0
+    if greedy
+        awinner = argmax(activity(actuator, i) for i in 1:Na)
+    else
+        θ = rand(rng) * S
+    #     @show [activity(actuator, i) for i in 1:Na] θ
+        s = 0.
+        for a in 1:Na
+            sa = activity(actuator, a)
+            s += sa
+            if s > θ
+                awinner = a
+                break
+            end
+        end
+    end
     for a in 1:Na
         sa = activity(actuator, a)
-        s += sa
-        if s > θ
+        if a == awinner
+#             @show (awinner, sa, S, postaction_activity_winner(actuator.activation, sa, S))
             setactivity!(actuator, a, postaction_activity_winner(actuator.activation, sa, S))
-            for a′ in a+1:Na
-                sa = activity(actuator, a′)
-                setactivity!(actuator, a′, postaction_activity_looser(actuator.activation, sa, S))
-            end
-#             @show actuator.code S sa
-            return a
         else
+#             @show (a, sa, S, postaction_activity_looser(actuator.activation, sa, S))
             setactivity!(actuator, a, postaction_activity_looser(actuator.activation, sa, S))
         end
     end
 #     @show actuator.code.x
-    return 0
+    return awinner
 end
 
 function wsample(weights; rng = Random.GLOBAL_RNG)
@@ -631,10 +664,10 @@ function propagate!(x::Tuple)
 end
 
 
-function micro_step!(brain::Brain; callback = () -> nothing)
+function micro_step!(brain::Brain; callback = () -> nothing, greedy = false)
     propagate!(brain.connections)
 #     @show brain.neurons[end-1].code
-    a = action!(brain.actuators)
+    a = action!(brain.actuators; greedy)
     update!(brain.connections)
     update!(brain.neurons)
 #     @show brain.neurons[end-1].code
@@ -643,12 +676,12 @@ function micro_step!(brain::Brain; callback = () -> nothing)
     a
 end
 
-function step!(brain, token, reward; callback = () -> nothing)
+function step!(brain, token, reward; callback = () -> nothing, greedy = false)
     sense!(brain.token_sensor, token)
     sense!(brain.reward_sensor, reward)
     callback()
     while brain.is_micro_step!()
-        a = micro_step!(brain; callback)
+        a = micro_step!(brain; callback, greedy)
 #         @show brain.actuators.code
         callback()
         if a > 0

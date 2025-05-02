@@ -105,18 +105,21 @@ end
                     is_micro_step! = FixedMicroSteps(N = 1))
     sense!(brain.token_sensor, Token(red, triangle))
     sense!(brain.reward_sensor, 0.)
-    for connection in brain.connections
-        propagate!(connection)
-    end
+    propagate!(brain.connections)
     a1 = action!(brain.actuators)
     @test activity(actuators, a1) == 1
-    for connection in brain.connections
-        update!(connection)
-    end
+    update!(brain.connections)
     @test connections[1].plasticity[1].eligibility[a1, 1] == 1
-    for neurons in brain.neurons
-        update!(neurons)
-    end
-    a2 = step!(brain, Token(blue, triangle), 1.)
+    update!(brain.neurons)
+    a2 = step!(brain, Token(red, triangle), 1.)
     @test connections[1].w[a1, 1] == 1.1
+    @test connections[1].w[a1 % 2 + 1, 1] == .1
+    a3 = step!(brain, Token(red, triangle), -.3)
+    if a1 == a2
+        @test connections[1].w[a1, 1] == .8
+        @test connections[1].w[a1 % 2 + 1, 1] == .1
+    else
+        @test connections[1].w[a1, 1] == 1.1
+        @test connections[1].w[a1 % 2 + 1, 1] == -.1
+    end
 end

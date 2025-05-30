@@ -1,5 +1,6 @@
+using NeuralProcessingOfTime: similarity
 using NeuralProcessingOfTime
-using DataFrames, PGFPlotsX, Statistics, ColorSchemes
+using DataFrames, PGFPlotsX, Statistics, ColorSchemes, Distributions
 import NeuralProcessingOfTime: age_at_similarity
 import NeuralProcessingOfTime: Token, Color, Shape, age_at_similarity, IdPlus, Clamp, Shifter
 import NeuralProcessingOfTime: Neurons, Distributed, Connection, TokenSensor, Hebbian,
@@ -18,18 +19,18 @@ const BASEPATH = joinpath(@__DIR__, "..")
 const DOCPATH = joinpath(BASEPATH, "doc")
 const DATAPATH = joinpath(BASEPATH, "data")
 
-using BSON, CodecZstd
+using Serialization, CodecZstd
 function csave(f, d)
     open(f, "w") do fd
         stream = ZstdCompressorStream(fd)
-        BSON.bson(stream, d)
+        serialize(stream, d)
         close(stream)
     end
 end
 function cload(f)
     open(f, "r") do fd
         stream = ZstdDecompressorStream(fd)
-        res = BSON.load(stream)
+        res = deserialize(stream)
         close(stream)
         res
     end
@@ -89,7 +90,7 @@ function stimuli_task2(; trials = 50, inter_trial = 5)
     tokens = [Token(red, triangle),
               Token(black, circle),
               Token(blue, square)]
-    sequence = Token[]
+    sequence = Token{Color, Shape}[]
     for t in 1:trials
         tok = iseven(t) ? tokens[1] : tokens[3]
         for filler in (1, 2)
@@ -113,7 +114,7 @@ function stimuli_task3(; trials = 50,
     tokens = [Token(red, triangle),
               Token(black, circle)
              ]
-    sequence = Token[]
+    sequence = Token{Color, Shape}[]
     for _ in 1:trials
         length(sequence) == max_length && return sequence
         push!(sequence, tokens[1])
@@ -146,7 +147,7 @@ function OptimalLearner(; only_age = false,
                    sinit,
                    Dict{typeof(sinit), Float64}())
 end
-query(::OptimalLearner{Tuple{Token,Int,Int}}, token, age, a) = (token, age, a)
+query(::OptimalLearner{<:Tuple{<:Token,Int,Int}}, token, age, a) = (token, age, a)
 query(::OptimalLearner{Tuple{Int,Int}}, token, age, a) = (age, a)
 function step!(o::OptimalLearner, token, reward; kwargs...)
     age = age_at_similarity(o.history, token, threshold = 1)
@@ -186,10 +187,10 @@ end
 function run_task3!(brain, history, tracker = TrackAll(); callback = () -> nothing)
     run_task!(brain, history, reward_task3, tracker; callback)
 end
-function run_task!(brain, history, reward, tracker; callback = () -> nothing)
+function run_task!(brain, history, reward, tracker; callback = () -> nothing, greedy = false)
     r = 0.
     for i in eachindex(history)
-        a = step!(brain, history[i], r; callback)
+        a = step!(brain, history[i], r; callback, greedy)
         r = reward(history[1:i-1], history[i], a)
         callback() == "x" && break
         tracker(a, r)
@@ -198,8 +199,8 @@ function run_task!(brain, history, reward, tracker; callback = () -> nothing)
 end
 
 # HebbianLatentStateDecay
-function initial_weights(n1, n2, w1, w2; only_first = false)
-    [only_first && j < length(n2) ? 0. : a == 1 ? w1 : w2 for a in 1:length(n1), j in 1:length(n2)]
+function initial_weights(n1, n2, w1, w2; only_first = false, with_bias = false)
+    [only_first && j < length(n2) ? 0. : a == 1 ? w1 : w2 for a in 1:length(n1), j in 1:length(n2) + with_bias]
 end
 function hebbian_latent_state_decay_brain(; winit = [.9, .2],
                                             only_first = false,
@@ -328,36 +329,49 @@ function chrono_brain(; winit = [.9, .2], only_first = false, η = 1., act = IdP
     Brain(; reward_sensor, token_sensor, connections, actuators, is_micro_step! = stepper)
 end
 
-function sparse_random_brain(; winit = [.9, .2], only_first = false, η = 1.,
+function sparse_random_brain(; winit = [.9, .2], only_first = false, η = 1., η_bias = nothing,
                                act = IdPlus(), clipper = Clamp(),
+                               n_intermediate = 50, n_content = 200, n_action = 2,
+                               latent_state_increment_factor = 6,
+                               n_color = length(instances(NeuralProcessingOfTime.Color)),
+                               n_shape = length(instances(NeuralProcessingOfTime.Shape)),
+                               sparsity = 1/(n_color+n_shape-2),
+                               max_fanin = n_color+n_shape-2,
+                               min_fanin = 1,
+                               with_readout_bias = true,
+                               latent_state_distribution = Uniform(0, latent_state_increment_factor),
+                               in_weights = nothing,
                                content_activation = x -> heaviside(x - 1.5))
-    actuators = Neurons("actuators", Distributed(x = zeros(2)), act)
-    token_sensor = TokenSensor()
+    actuators = Neurons("actuators", Distributed(x = zeros(n_action)), act)
+    token_sensor = TokenSensor(; n_color, n_shape)
     reward_sensor = RewardSensor()
-    intermediate = Neurons("intermediate", Distributed(50), heaviside)
-    content = Neurons("content", Distributed(200), content_activation)
+    intermediate = Neurons("intermediate", Distributed(n_intermediate), heaviside)
+    content = Neurons("content", Distributed(n_content), content_activation)
     stepper = FixedMicroSteps(N = 3)
     connections = (
-                   SparseRandomConnection(pre = token_sensor.neurons,
-                                          post = intermediate,
-                                          sparsity = 1/12),
+                   SparseRandomConnection(; pre = token_sensor.neurons,
+                                            post = intermediate,
+                                            sparsity),
                    SparseRandomConnection(pre = token_sensor.neurons,
                                           post = content,
-                                          sparsity = RandomInFan(min = 1, max = 12)),
+                                          weights = in_weights,
+                                          sparsity = RandomInFan(min = min_fanin, max = max_fanin)),
                    Connection(plasticity = (HebbianLatentStateDecay(pre = intermediate,
                                                                     post = content,
                                                                     kind = Additive(1/3),
-                                                                    latent_state_increment = 6*hcat(fill(rand(length(content)), length(intermediate))...)
+                                                                    latent_state_increment = hcat(fill(rand(latent_state_distribution, length(content)), length(intermediate))...)
                                                                    ), ),
                               pre = intermediate,
                               post = content),
                    Connection(plasticity = (RewardModulatedHebbian(; pre = content,
                                                                      post = actuators,
-                                                                     η, clipper,
+                                                                     with_bias = with_readout_bias,
+                                                                     η, η_bias, clipper,
                                                                      reward_sensor),),
                               pre = content, post = actuators,
+                              with_bias = with_readout_bias,
                               modulator = OnlyActiveAtStep(3, stepper),
-                              w = initial_weights(actuators, content, winit[1], winit[2]; only_first)
+                              w = initial_weights(actuators, content, winit[1], winit[2]; only_first, with_bias = with_readout_bias)
                              )
                   )
     Brain(; reward_sensor, token_sensor, connections, actuators, is_micro_step! = stepper)
@@ -396,9 +410,9 @@ brains = Dict(:state_decay => hebbian_latent_state_decay_brain,
               :chrono => chrono_brain,
              )
 
-# push!(PGFPlotsX.CUSTOM_PREAMBLE, read(joinpath(DOCPATH, "modelnames.tex"), String))
+push!(PGFPlotsX.CUSTOM_PREAMBLE, read(joinpath(DOCPATH, "modelnames.tex"), String))
 
-function names(s; extra = Dict())
+function modelnames(s; extra = Dict())
     haskey(extra, s) && return extra[s]
     spl = split("$s", '_')
     name = if spl[1] == "sparse"
@@ -406,7 +420,7 @@ function names(s; extra = Dict())
         raw"\sparse{}"
     elseif spl[1] == "increment"
 #         "Representational-Drift"
-        raw"\increment{}"
+        raw"\incrementmodel{}"
     elseif spl[1] == "state"
 #         "Organized-Pruning"
         raw"\statedecay{}"
@@ -477,8 +491,8 @@ end
 
 res1[:ap] = action_prior(winit = [.5, .5])
 
-csave(joinpath(DATAPATH, "task1.bson.zstd"), res1)
-res1 = cload(joinpath(DATAPATH, "task1.bson.zstd"))
+csave(joinpath(DATAPATH, "task1.dat.zstd"), res1)
+res1 = cload(joinpath(DATAPATH, "task1.dat.zstd"))
 
 ks = sort(collect(filter(x -> x != :ap && (false || split("$x", '_')[end] == "exp"), keys(res1))))
 
@@ -491,7 +505,7 @@ f1 = @pgf PGFPlotsX.Axis({xlabel = raw"$\Delta t_\mathrm{test}$",
                  Coordinates(1:5, analyse_results(res1[k]).act2))
             for k in ks]...,
            Plot({black, dotted}, Expression("$(res1[:ap])")),
-           PGFPlotsX.Legend([names.(ks);
+           PGFPlotsX.Legend([modelnames.(ks);
                              "before learning"])
           )
 
@@ -517,8 +531,8 @@ for (nb, b) in brains
     end
 end
 
-csave(joinpath(DATAPATH, "task2.bson.zstd"), res2)
-res2 = cload(joinpath(DATAPATH, "task2.bson.zstd"))
+csave(joinpath(DATAPATH, "task2.dat.zstd"), res2)
+res2 = cload(joinpath(DATAPATH, "task2.dat.zstd"))
 
 session_average(x, l = 4) = [mean(x[(i-1)*l+1:i*l]) for i in 1:length(x)÷l]
 
@@ -533,7 +547,7 @@ f2 = @pgf PGFPlotsX.Axis({legend_pos = "outer north east", xlabel = "session",
             for k in ks]...,
            Plot({dotted}, Coordinates(1:200, session_average(res2[:optimal]))),
            Plot({dotted, orange}, Coordinates(1:200, fill(0.5, 200))),
-           PGFPlotsX.Legend([names.(ks); "optimal"; "best linear"
+           PGFPlotsX.Legend([modelnames.(ks); "optimal"; "best linear"
                             ])
           )
 
@@ -558,8 +572,8 @@ for (nb, b) in brains
     end
 end
 
-csave(joinpath(DATAPATH, "task3.bson.zstd"), res3)
-res3 = cload(joinpath(DATAPATH, "task3.bson.zstd"))
+csave(joinpath(DATAPATH, "task3.dat.zstd"), res3)
+res3 = cload(joinpath(DATAPATH, "task3.dat.zstd"))
 
 function best_of_kind(res, key, f = identity)
     ks = filter(x -> match(Regex(key), String(x)) !== nothing, keys(res))
@@ -573,8 +587,208 @@ f3 = @pgf PGFPlotsX.Axis({legend_pos = "outer north east", xlabel = "trial",
                [Plot({styles(k)...},
                      Coordinates(1:100, res3[k])) for k in ks]...,
                Plot({dotted}, Coordinates(1:100, res3[:optimal])),
-               PGFPlotsX.Legend([names.(ks); "optimal"])
+               PGFPlotsX.Legend([modelnames.(ks); "optimal"])
               )
 
 
 pgfsave(joinpath(DOCPATH, "sim3.tikz"), f3)
+
+
+###
+### Food Caching Simulation
+###
+
+function stimuli_foodcaching(; T = 20_000, n_color = 10_000, n_shape = 10)
+    sequence = Token{Int,Int}[]
+    locations = randperm(n_color-1)
+    cache_event_counter = 1
+    for t in 1:T
+        if length(sequence) > 10 && rand() > 1/3 # probe
+            # power law sampling of past locations
+            recall_weight = 1 ./ sqrt.((length(sequence):-1:1))
+            c = 0
+            while true
+                idx = NeuralProcessingOfTime.wsample(recall_weight)
+                token = sequence[idx]
+                if token.s > 0 # look only at cache locations
+                    c = token.c
+                    break
+                end
+            end
+            token = Token(c, 0)
+        else
+            token = Token(locations[cache_event_counter], rand(1:n_shape-1))
+            cache_event_counter += 1
+        end
+        push!(sequence, token)
+    end
+    sequence
+end
+function optimal_action_foodcaching(history, query)
+    query.s != 0 && return 2
+    age = age_at_similarity(history, query, threshold = 1, similarity = NeuralProcessingOfTime.csimilarity)
+    token = history[end-age+1]
+    2-Int(age < (token.s == 0 ? 0 : token.s == 1 ? 10. : token.s == 2 ? 20. : 160.))
+end
+function optimal_action_oneage_foodcaching(history, query, refage)
+    query.s != 0 && return 2
+    age = age_at_similarity(history, query, threshold = 1, similarity = NeuralProcessingOfTime.csimilarity)
+    token = history[end-age+1]
+    2-Int(age < (token.s == 0 ? 0 : refage))
+end
+function reward_foodcaching(history, query, action)
+    (query.s != 0 || action == 0 || action == 2) && return 0.
+    age = age_at_similarity(history, query, threshold = 1, similarity = NeuralProcessingOfTime.csimilarity)
+    token = history[end-age+1]
+    float(age < (token.s == 0 ? 0 : token.s == 1 ? 10. : token.s == 2 ? 20. : 160.))-.2
+end
+function foodcaching_rewards(stimuli, policy)
+    [reward_foodcaching(stimuli[1:t-1], stimuli[t],
+                    policy(stimuli[1:t-1], stimuli[t]))
+     for t in eachindex(stimuli)]
+end
+function special_connections!(bigbrain; n_color, n_shape, only_shape_content = false, ks = [10, 20, 160])
+    for i in 1:n_color-1, j in 1:2
+        bigbrain.connections[1].idxs[2*(i-1) + j] = [i]
+    end
+    if only_shape_content
+        for j in 1:n_shape-1, k in eachindex(ks)
+            post_idx = length(ks)*(j-1) + k
+            bigbrain.connections[2].idxs[post_idx] = [n_color-1 + j]
+            bigbrain.connections[3].plasticity[1].latent_state_increment[post_idx, :] .= ks[k]
+            bigbrain.connections[4].w[1, post_idx] = j == 1 ? .4 : j == 2 ? .9 : 1.2
+            bigbrain.connections[4].w[2, post_idx] = 0
+        end
+    else
+        for i in 1:n_color-1, j in 1:n_shape-1, k in eachindex(ks)
+            post_idx = length(ks)*(i-1) + length(ks)*(n_color-1)*(j-1) + k
+            bigbrain.connections[2].idxs[post_idx] = [i, n_color-1 + j]
+            bigbrain.connections[3].plasticity[1].latent_state_increment[post_idx, :] .= ks[k]
+            bigbrain.connections[4].w[1, post_idx] = j == 1 ? .4 : j == 2 ? .9 : 1.2
+            bigbrain.connections[4].w[2, post_idx] = 0
+        end
+    end
+    # bias
+    bigbrain.connections[4].w[1, end] = 0.
+    bigbrain.connections[4].w[2, end] = 1.
+    bigbrain
+end
+
+Random.seed!(1221)
+n_color = 1000
+n_shape = 4
+T = 2*n_color
+bigbrain = sparse_random_brain(; act = exp, clipper = identity, n_intermediate = 5*(n_color-1), n_content = 20*(n_shape-1), latent_state_increment_factor = 200, n_color, n_shape, η = .02, η_bias = 0, winit = [1/10, 0], max_fanin = 3, min_fanin = 1, sparsity = 1/n_color, in_weights = [fill(1/(n_color-1), n_color - 1); fill(2/(n_shape-1), n_shape - 1)], content_activation = heaviside)
+bigbrain.connections[4].w[:, end] .= [0, 1]
+results = []
+baseline_policies = (best = optimal_action_foodcaching,
+                     worst = (h, ht) -> optimal_action_foodcaching(h, ht) == 1 ? 2 : 1,
+                     random = (_, _) -> rand(1:2),
+                     all1 = (_, _) -> 1,
+                     all2 = (_, _) -> 2,
+                     oneage1 = (h, ht) -> optimal_action_oneage_foodcaching(h, ht, 10),
+                     oneage2 = (h, ht) -> optimal_action_oneage_foodcaching(h, ht, 20),
+                     oneage3 = (h, ht) -> optimal_action_oneage_foodcaching(h, ht, 160))
+Random.seed!(20)
+for epoch in 1:30
+    stimuli = stimuli_foodcaching(; T, n_color, n_shape);
+    baselines = map(p -> foodcaching_rewards(stimuli, p), baseline_policies)
+    @time res = run_task!(bigbrain, stimuli, reward_foodcaching, TrackAll(), greedy = true)
+    @show epoch map(sum, baselines) sum(res.r)
+    push!(results, (; stimuli, baselines, res))
+end
+
+csave(joinpath(DATAPATH, "foodcaching.dat.zstd"), results)
+
+Random.seed!(1221)
+n_color = 1000
+n_shape = 4
+T = 2*n_color
+bigbrain = sparse_random_brain(; act = exp, clipper = identity, n_intermediate = 2*(n_color-1), n_content = 3*(n_shape-1), latent_state_increment_factor = 200, n_color, n_shape, η = .02, η_bias = 0., winit = [.5, .5], max_fanin = 3, min_fanin = 2, sparsity = 2/n_color, in_weights = [fill(1/(n_color-1), n_color - 1); fill(2/(n_shape-1), n_shape - 1)], content_activation = heaviside)
+special_connections!(bigbrain; n_color, n_shape, only_shape_content = true)
+bigbrain.connections[4].w[1, 1:end-1] .= 1.01
+bigbrain.connections[4].w[2, 1:end-1] .= 0
+results2 = []
+Random.seed!(20)
+for epoch in 1:30
+    stimuli = stimuli_bigtask(; T, n_color, n_shape);
+    baselines = map(p -> bigtask_rewards(stimuli, p), baseline_policies)
+    @time res = run_task!(bigbrain, stimuli, reward_bigtask, TrackAll(), greedy = true)
+    @show epoch map(sum, baselines) sum(res.r)
+    push!(results2, (; stimuli, baselines, res))
+end
+
+csave(joinpath(DATAPATH, "foodcaching2.dat.zstd"), results2)
+
+function result_dataframe(results, baseline_policies)
+    resultdf = vcat([DataFrame(map(p -> foodcaching_rewards(r.stimuli, p),
+                                   baseline_policies))
+                     for r in results]...)
+    resultdf.model = vcat(getproperty.(getproperty.(results, :res), :r)...)
+    test = vcat([[t.s == 0 for t in r.stimuli] for r in results]...)
+    resultdf = resultdf[test, :]
+end
+resultdf1 = result_dataframe(results, baseline_policies)
+resultdf2 = result_dataframe(results2, baseline_policies)
+
+struct Smoother
+    weights::Vector{Float64}
+    center::Int
+    stride::Int
+end
+Smoother(; σ = 500, b = 8, stride = σ÷10) = Smoother([exp(-d^2/σ^2) for d in -b*σ:b*σ], b * σ, stride)
+(s::Smoother)(x) = s.(Ref(x), 1:s.stride:length(x))
+function (s::Smoother)(x, i)
+    n = 0.
+    y = 0.
+    ws, c = s.weights, s.center
+    for j in max(1, i - c):min(length(x), i + c)
+        w = ws[j - i + c + 1]
+        y += w * x[j]
+        n += w
+    end
+    y/n
+end
+struct Scaler
+    min::Vector{Float64}
+    max::Vector{Float64}
+end
+(s::Scaler)(x) = @. (x - s.min) / (s.max - s.min)
+
+smoother = Smoother(σ = 500)
+scaler = Scaler(smoother(resultdf2.random), smoother(resultdf2.best))
+
+ks = setdiff(names(resultdf1), ["worst", "all2"])
+modelname = Dict("best" => "optimal",
+                 "random" => "uniform random",
+                 "all1" => "always retrieve",
+                 "all2" => "never retrieve",
+                 "oneage1" => "retrieve if age \$\\leq\$ 10 steps",
+                 "oneage2" => "retrieve if age \$\\leq\$ 20 steps",
+                 "oneage3" => "retrieve if age \$\\leq\$ 160 steps",
+                 "model" => modelnames("chrono"),
+                 "model2" => modelnames("sparse"))
+cs = Dict("best" => @pgf({black, dotted, thick}),
+          "worst" => @pgf({black, dotted}),
+          "random" => @pgf({black,dashed}),
+          "all1" => @pgf({green!50!black}),
+          "all2" => @pgf({blue,dashed}),
+          "oneage1" => @pgf({green!50!black,dashed}),
+          "oneage2" => @pgf({green!50!black,"dash dot"}),
+          "oneage3" => @pgf({green!50!black,dotted}),
+          "model" => styles("chrono"),
+          "model2" => styles("sparse"),
+         )
+
+f4 = @pgf PGFPlotsX.Axis({legend_pos = "outer north east", xlabel = "retrieval test event",
+               ylabel = "average normalized reward", ymin = -.1, "very thick"},
+            Plot(cs["model2"], Coordinates(1:smoother.stride:nrow(resultdf1),
+                                          scaler(smoother(resultdf1.model)))),
+            [Plot(cs[k],
+                  Coordinates(1:smoother.stride:nrow(resultdf1), scaler(smoother(getproperty(resultdf2, k))))) for k in reverse(ks)]...,
+            PGFPlotsX.Legend(map(x -> modelname[x], reverse([ks; "model2"])))
+              )
+
+
+pgfsave(joinpath(DOCPATH, "sim_caching.tikz"), f4)
+

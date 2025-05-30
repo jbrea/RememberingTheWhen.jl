@@ -1,8 +1,8 @@
 [deps]
-BSON = "fbb218c0-5317-5bc6-957e-2ee96dd4b1f0"
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
 ColorSchemes = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 NeuralProcessingOfTime = "a4364fb4-1fcc-459a-aec0-57eb10f36bbf"
 PGFPlotsX = "8314cec4-20b6-5062-9cdb-752b83310925"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
